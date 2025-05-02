@@ -33,10 +33,6 @@ struct SharedData
     std::atomic<bool> isMining{false};
 };
 
-const int r = CAPTURE_REGION.radius;
-const int W = 2 * r, H = 2 * r;
-cv::Mat mask(H, W, CV_8UC1);
-
 class ScreenCapture
 {
 public:
@@ -95,52 +91,61 @@ private:
     cv::Mat img;
 };
 
-static bool fastDetectBounds(const cv::Mat &imgBGRA,
-                             const Color &c,
-                             Point &minP, Point &maxP,
-                             cv::Mat &mask)
+static bool fastDetectBounds(const cv::Mat &img, const Color &c, Point &minP, Point &maxP)
 {
-    const uint8_t *data = imgBGRA.data;
-    const size_t step = imgBGRA.step;
-    uint8_t *maskData = mask.data;
-    const size_t maskStep = mask.step;
-    const uint32_t target = (c.b) | (c.g << 8) | (c.r << 16);
-    const uint32_t maskColor = 0x00FFFFFF;
+    uint32_t target = (c.b) | (c.g << 8) | (c.r << 16) | (255 << 24);
+    bool found = false;
+    int minX = img.cols, minY = img.rows, maxX = 0, maxY = 0;
 
-    for (int y = 0; y < imgBGRA.rows; ++y)
+#pragma omp parallel for schedule(static)
+    for (int y = 0; y < img.rows; ++y)
     {
-        const uint32_t *row = reinterpret_cast<const uint32_t *>(data + y * step);
-        uint8_t *maskRow = maskData + y * maskStep;
-        for (int x = 0; x < imgBGRA.cols; ++x)
+        const uint32_t *row = img.ptr<uint32_t>(y);
+        for (int x = 0; x < img.cols; ++x)
         {
-            maskRow[x] = ((row[x] & maskColor) == target) ? 255 : 0;
+            if (row[x] == target)
+            {
+#pragma omp critical
+                {
+                    if (!found)
+                        found = true;
+                    if (x < minX)
+                        minX = x;
+                    if (x > maxX)
+                        maxX = x;
+                    if (y < minY)
+                        minY = y;
+                    if (y > maxY)
+                        maxY = y;
+                }
+            }
         }
     }
 
-    if (cv::countNonZero(mask) == 0)
-        return false;
-
-    cv::Rect bb = cv::boundingRect(mask);
-    minP = {bb.x, bb.y};
-    maxP = {bb.x + bb.width - 1, bb.y + bb.height - 1};
-    return true;
+    if (found)
+    {
+        minP = {minX, minY};
+        maxP = {maxX, maxY};
+        return true;
+    }
+    return false;
 }
 
-static bool fastDetectColorPresence(const cv::Mat &imgBGRA, const Color &c)
+static bool fastDetectColorPresence(const cv::Mat &img, const Color &c)
 {
-    const uint8_t *data = imgBGRA.data;
-    const size_t step = imgBGRA.step;
-    const uint32_t target = (c.b) | (c.g << 8) | (c.r << 16);
-    const uint32_t mask = 0x00FFFFFF;
-
-    for (int y = 0; y < imgBGRA.rows; ++y)
+    uint32_t target = (c.b) | (c.g << 8) | (c.r << 16) | (255 << 24);
+#pragma omp parallel for schedule(static)
+    for (int y = 0; y < img.rows; ++y)
     {
-        const uint32_t *row = reinterpret_cast<const uint32_t *>(data + y * step);
-        for (int x = 0; x < imgBGRA.cols; ++x)
+        const uint32_t *row = img.ptr<uint32_t>(y);
+        for (int x = 0; x < img.cols; ++x)
         {
-            if ((row[x] & mask) == target)
+            if (row[x] == target)
             {
-                return true;
+#pragma omp critical
+                {
+                    return true;
+                }
             }
         }
     }
@@ -149,12 +154,20 @@ static bool fastDetectColorPresence(const cv::Mat &imgBGRA, const Color &c)
 
 static void detection(SharedData &sd, std::atomic<bool> &run)
 {
+    const int r = CAPTURE_REGION.radius;
+    const int W = 2 * r, H = 2 * r;
     const int ox = CAPTURE_REGION.x - r;
     const int oy = CAPTURE_REGION.y - r;
 
     std::unique_ptr<ScreenCapture> capFull;
     HWND lastHwnd = nullptr;
     bool cursorClicked = false;
+
+    const cv::Scalar tgt(TARGET_COLOR.b, TARGET_COLOR.g, TARGET_COLOR.r, 255);
+    const cv::Scalar cur(CURSOR_COLOR.b, CURSOR_COLOR.g, CURSOR_COLOR.r, 255);
+    cv::Mat full, mask, submask, loc;
+
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
     while (run)
     {
@@ -170,7 +183,7 @@ static void detection(SharedData &sd, std::atomic<bool> &run)
             sd.isMining = false;
             sd.isInCursorLoop = false;
             cursorClicked = false;
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
 
@@ -182,7 +195,7 @@ static void detection(SharedData &sd, std::atomic<bool> &run)
         sd.isInCursorLoop = false;
 
         Point tgtMin{}, tgtMax{};
-        if (fastDetectBounds(frame, TARGET_COLOR, tgtMin, tgtMax, mask))
+        if (fastDetectBounds(frame, TARGET_COLOR, tgtMin, tgtMax))
         {
             sd.isMining = true;
             int w = tgtMax.x - tgtMin.x + 1;
@@ -194,8 +207,7 @@ static void detection(SharedData &sd, std::atomic<bool> &run)
             {
                 if (!cursorClicked)
                 {
-                    mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
-                    mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+                    mouse_event(MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
                     cursorClicked = true;
                 }
                 sd.isInCursorLoop = true;
